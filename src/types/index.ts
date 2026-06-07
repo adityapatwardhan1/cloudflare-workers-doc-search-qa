@@ -3,6 +3,7 @@ export interface Env {
   KV_CACHE: KVNamespace;
   DB_D1: D1Database;
   VECTOR_INDEX: Vectorize;
+  API_KEY?: string;
 }
 
 export const EMBEDDING_MODEL = "@cf/baai/bge-large-en-v1.5" as const;
@@ -16,7 +17,8 @@ export const KV_SEARCH_PREFIX = "search:" as const;
 export const KV_ANSWER_PREFIX = "answer:" as const;
 export const VECTOR_TOP_K = 5;
 
-export const CHUNK_SIZE = 1000;
+export const EMBEDDING_MAX_CHARS = 1200;
+export const CHUNK_SIZE = 800;
 export const CHUNK_OVERLAP = 200;
 export const CHUNK_STRIDE = CHUNK_SIZE - CHUNK_OVERLAP;
 export const EMBEDDING_BATCH_SIZE = 8;
@@ -121,6 +123,7 @@ export interface AuditLogRow {
   readonly id: string;
   readonly query_hash: string;
   readonly cache_hit: number;
+  readonly answer_cache_hit: number;
   readonly latency_cache_ms: number;
   readonly latency_vector_ms: number;
   readonly latency_ai_ms: number;

@@ -2,6 +2,10 @@ name = "doc-search-qa"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+# Uncomment and set for production deployments:
+# [vars]
+# API_KEY = "your-secret-key"
+
 [ai]
 binding = "AI"
 remote = true

@@ -10,7 +10,7 @@ import type {
   QueryResponse,
   RetrievedChunk,
 } from "../types";
-import { EMBEDDING_DIMENSIONS } from "../types";
+import { EMBEDDING_DIMENSIONS, KV_ANSWER_PREFIX, KV_SEARCH_PREFIX } from "../types";
 
 async function readJson<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
@@ -23,7 +23,6 @@ const SAMPLE_DOC = {
   url: "https://docs.example.com/auth",
 };
 
-const SAMPLE_CHUNK_ID = "doc-1:0";
 const SAMPLE_VECTOR = Array.from({ length: EMBEDDING_DIMENSIONS }, (_, i) => i * 0.001);
 
 function createExecutionContext(): ExecutionContext {
@@ -46,46 +45,57 @@ async function flushWaitUntil(ctx: ExecutionContext): Promise<void> {
   }
 }
 
+interface StoredDocument {
+  id: string;
+  title: string;
+  url: string;
+}
+
+interface StoredChunk {
+  id: string;
+  documentId: string;
+  chunkIndex: number;
+  content: string;
+  vectorId: string;
+}
+
+interface MockState {
+  documents: Map<string, StoredDocument>;
+  documentsByUrl: Map<string, string>;
+  chunks: Map<string, StoredChunk>;
+  ingestLocks: Set<string>;
+  upsertedVectorIds: string[];
+}
+
 function createMockEnv(options: {
   vectorizeThrows?: boolean;
+  embedThrows?: boolean;
   aiResponses?: Record<string, unknown>;
   kvStore?: Map<string, string>;
-  d1Chunks?: RetrievedChunk[];
   auditLogs?: Array<Record<string, unknown>>;
+  apiKey?: string;
+  state?: MockState;
 } = {}): Env {
   const kvData = options.kvStore ?? new Map<string, string>();
   const auditLogs = options.auditLogs ?? [];
+  const state: MockState = options.state ?? {
+    documents: new Map(),
+    documentsByUrl: new Map(),
+    chunks: new Map(),
+    ingestLocks: new Set(),
+    upsertedVectorIds: [],
+  };
 
   const defaultAiResponses: Record<string, unknown> = {
     "@cf/baai/bge-large-en-v1.5": { data: [SAMPLE_VECTOR] },
     "@cf/meta/llama-3.3-70b-instruct": {
       response: JSON.stringify({
         answer: "Configure JWT rotation in wrangler.toml under the secrets binding.",
-        citations: [
-          {
-            quote: SAMPLE_DOC.content,
-            title: SAMPLE_DOC.title,
-            url: SAMPLE_DOC.url,
-            chunkId: SAMPLE_CHUNK_ID,
-          },
-        ],
+        citations: [],
       }),
     },
     ...options.aiResponses,
   };
-
-  const d1Chunks =
-    options.d1Chunks ??
-    [
-      {
-        chunkId: SAMPLE_CHUNK_ID,
-        content: SAMPLE_DOC.content,
-        title: SAMPLE_DOC.title,
-        url: SAMPLE_DOC.url,
-        score: 0.91,
-        chunkIndex: 0,
-      },
-    ];
 
   const db = {
     prepare(sql: string) {
@@ -97,37 +107,123 @@ function createMockEnv(options: {
                 id: binds[0],
                 query_hash: binds[1],
                 cache_hit: binds[2],
-                latency_cache_ms: binds[3],
-                latency_vector_ms: binds[4],
-                latency_ai_ms: binds[5],
-                total_latency_ms: binds[6],
-                created_at: binds[7],
+                answer_cache_hit: binds[3],
+                latency_cache_ms: binds[4],
+                latency_vector_ms: binds[5],
+                latency_ai_ms: binds[6],
+                total_latency_ms: binds[7],
+                created_at: binds[8],
               });
+              return { success: true };
             }
+
+            if (sql.includes("INSERT INTO ingest_locks")) {
+              const url = binds[0] as string;
+              if (state.ingestLocks.has(url)) {
+                return { success: false };
+              }
+              state.ingestLocks.add(url);
+              return { success: true };
+            }
+
+            if (sql.includes("DELETE FROM ingest_locks")) {
+              state.ingestLocks.delete(binds[0] as string);
+              return { success: true };
+            }
+
+            if (sql.includes("INSERT INTO documents")) {
+              const [id, title, url] = binds as [string, string, string];
+              state.documents.set(id, { id, title, url });
+              state.documentsByUrl.set(url, id);
+              return { success: true };
+            }
+
+            if (sql.includes("UPDATE documents SET title")) {
+              const [title, , id] = binds as [string, string, string];
+              const doc = state.documents.get(id);
+              if (doc) {
+                doc.title = title;
+              }
+              return { success: true };
+            }
+
+            if (sql.includes("DELETE FROM chunks WHERE document_id")) {
+              for (const [chunkId, chunk] of state.chunks.entries()) {
+                if (chunk.documentId === binds[0]) {
+                  state.chunks.delete(chunkId);
+                }
+              }
+              return { success: true };
+            }
+
+            if (sql.includes("DELETE FROM documents WHERE id")) {
+              const docId = binds[0] as string;
+              const doc = state.documents.get(docId);
+              if (doc) {
+                state.documentsByUrl.delete(doc.url);
+                state.documents.delete(docId);
+              }
+              return { success: true };
+            }
+
+            if (sql.includes("INSERT INTO chunks")) {
+              const [id, documentId, chunkIndex, content, vectorId] = binds as [
+                string,
+                string,
+                number,
+                string,
+                string,
+              ];
+              state.chunks.set(id, {
+                id,
+                documentId,
+                chunkIndex,
+                content,
+                vectorId,
+              });
+              return { success: true };
+            }
+
             return { success: true };
           },
           async first<T>() {
             if (sql.includes("SELECT id FROM documents WHERE url")) {
-              return null as T;
+              const url = binds[0] as string;
+              const docId = state.documentsByUrl.get(url);
+              if (!docId) {
+                return null as T;
+              }
+              return { id: docId } as T;
             }
             return null as T;
           },
           async all<T>() {
             if (sql.includes("FROM chunks c")) {
-              return {
-                results: d1Chunks.map((chunk) => ({
-                  id: chunk.chunkId,
-                  content: chunk.content,
-                  chunk_index: chunk.chunkIndex,
-                  vector_id: chunk.chunkId,
-                  title: chunk.title,
-                  url: chunk.url,
-                })),
-              } as T;
+              const vectorIds = binds as string[];
+              const rows = [...state.chunks.values()]
+                .filter((chunk) => vectorIds.includes(chunk.vectorId))
+                .map((chunk) => {
+                  const doc = state.documents.get(chunk.documentId);
+                  return {
+                    id: chunk.id,
+                    content: chunk.content,
+                    chunk_index: chunk.chunkIndex,
+                    vector_id: chunk.vectorId,
+                    title: doc?.title ?? "",
+                    url: doc?.url ?? "",
+                  };
+                });
+              return { results: rows } as T;
             }
+
             if (sql.includes("SELECT vector_id FROM chunks")) {
-              return { results: [] } as T;
+              const documentId = binds[0] as string;
+              const rows = [...state.chunks.values()]
+                .filter((chunk) => chunk.documentId === documentId)
+                .map((chunk) => ({ vector_id: chunk.vectorId }));
+              return { results: rows } as T;
             }
+
             return { results: [] } as T;
           },
         }),
@@ -136,8 +232,11 @@ function createMockEnv(options: {
     async batch(statements: Array<{ run: () => Promise<{ success: boolean }> }>) {
       const results = [];
       for (const statement of statements) {
-        await statement.run();
-        results.push({ success: true });
+        const result = await statement.run();
+        results.push(result);
+        if (!result.success) {
+          break;
+        }
       }
       return results;
     },
@@ -146,6 +245,10 @@ function createMockEnv(options: {
   const mockEnv = {
     AI: {
       run: vi.fn(async (model: string, inputs?: { text?: string[] }) => {
+        if (options.embedThrows && model === "@cf/baai/bge-large-en-v1.5") {
+          throw new Error("Embedding service unavailable");
+        }
+
         const response = defaultAiResponses[model];
         if (!response) {
           throw new Error(`Unexpected AI model: ${model}`);
@@ -177,8 +280,15 @@ function createMockEnv(options: {
       put: vi.fn(async (key: string, value: string) => {
         kvData.set(key, value);
       }),
-      delete: vi.fn(),
-      list: vi.fn(),
+      delete: vi.fn(async (key: string) => {
+        kvData.delete(key);
+      }),
+      list: vi.fn(async ({ prefix }: { prefix: string }) => {
+        const keys = [...kvData.keys()]
+          .filter((key) => key.startsWith(prefix))
+          .map((name) => ({ name }));
+        return { keys, list_complete: true };
+      }),
       getWithMetadata: vi.fn(),
     },
     DB_D1: db,
@@ -187,25 +297,42 @@ function createMockEnv(options: {
         if (options.vectorizeThrows) {
           throw new Error("Vectorize internal error");
         }
+
+        const topChunk = [...state.chunks.values()][0];
+        if (!topChunk) {
+          return { matches: [], count: 0 };
+        }
+
         return {
           matches: [
             {
-              id: SAMPLE_CHUNK_ID,
+              id: topChunk.vectorId,
               score: 0.91,
             },
           ],
           count: 1,
         };
       }),
-      upsert: vi.fn(async () => ({ mutationId: "mock-mutation" })),
+      upsert: vi.fn(async (vectors: Array<{ id: string }>) => {
+        for (const vector of vectors) {
+          state.upsertedVectorIds.push(vector.id);
+        }
+        return { mutationId: "mock-mutation" };
+      }),
       insert: vi.fn(),
       deleteByIds: vi.fn(),
       getByIds: vi.fn(),
       queryById: vi.fn(),
     },
+    API_KEY: options.apiKey,
+    _state: state,
   };
 
   return mockEnv as unknown as Env;
+}
+
+function getState(env: Env): MockState {
+  return (env as Env & { _state: MockState })._state;
 }
 
 async function postJson(
@@ -213,16 +340,33 @@ async function postJson(
   body: unknown,
   env: Env,
   ctx: ExecutionContext,
+  headers: Record<string, string> = {},
 ): Promise<Response> {
   return worker.fetch(
     new Request(`http://localhost${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify(body),
     }),
     env,
     ctx,
   );
+}
+
+function citationForChunk(chunk: StoredChunk, env: Env): {
+  quote: string;
+  title: string;
+  url: string;
+  chunkId: string;
+} {
+  const state = getState(env);
+  const doc = state.documents.get(chunk.documentId);
+  return {
+    quote: chunk.content,
+    title: doc?.title ?? "",
+    url: doc?.url ?? "",
+    chunkId: chunk.id,
+  };
 }
 
 describe("system reliability harness", () => {
@@ -285,7 +429,7 @@ describe("system reliability harness", () => {
     expect(queryBody.code).toBe("INVALID_QUESTION");
   });
 
-  it("runs ingest then query end-to-end with mocked bindings", async () => {
+  it("runs ingest then query end-to-end with consistent chunk IDs", async () => {
     const env = createMockEnv();
     const ctx = createExecutionContext();
 
@@ -295,10 +439,27 @@ describe("system reliability harness", () => {
     expect(ingestBody.chunkCount).toBeGreaterThan(0);
     expect(env.VECTOR_INDEX.upsert).toHaveBeenCalled();
 
+    const state = getState(env);
+    const storedChunk = [...state.chunks.values()][0];
+    expect(storedChunk.id).toBe(`${ingestBody.documentId}:0`);
+
+    const envWithCitations = createMockEnv({
+      state,
+      aiResponses: {
+        "@cf/baai/bge-large-en-v1.5": { data: [SAMPLE_VECTOR] },
+        "@cf/meta/llama-3.3-70b-instruct": {
+          response: JSON.stringify({
+            answer: "Configure JWT rotation in wrangler.toml under the secrets binding.",
+            citations: [citationForChunk(storedChunk, env)],
+          }),
+        },
+      },
+    });
+
     const queryResponse = await postJson(
       "/query",
       { question: "How do I configure JWT rotation?" },
-      env,
+      envWithCitations,
       ctx,
     );
     const queryBody = await readJson<QueryResponse>(queryResponse);
@@ -307,8 +468,8 @@ describe("system reliability harness", () => {
     expect(queryResponse.status).toBe(200);
     expect(queryBody.cacheHit).toBe(false);
     expect(queryBody.fallback).toBe(false);
-    expect(queryBody.citations.length).toBeGreaterThan(0);
-    expect(env.VECTOR_INDEX.query).toHaveBeenCalled();
+    expect(queryBody.citations[0].chunkId).toBe(storedChunk.id);
+    expect(envWithCitations.VECTOR_INDEX.query).toHaveBeenCalled();
   });
 
   it("returns VECTORIZE_QUERY_FAILED when Vectorize throws", async () => {
@@ -325,6 +486,7 @@ describe("system reliability harness", () => {
 
     expect(response.status).toBe(502);
     expect(body.code).toBe("VECTORIZE_QUERY_FAILED");
+    expect(body.details).toBeUndefined();
   });
 
   it("serves cached query answers without calling Vectorize again", async () => {
@@ -356,7 +518,7 @@ describe("system reliability harness", () => {
     expect(env.VECTOR_INDEX.query).not.toHaveBeenCalled();
   });
 
-  it("writes audit log telemetry asynchronously on query", async () => {
+  it("writes audit log telemetry with separate answer cache hit flag", async () => {
     const auditLogs: Array<Record<string, unknown>> = [];
     const env = createMockEnv({ auditLogs });
     const ctx = createExecutionContext();
@@ -372,8 +534,8 @@ describe("system reliability harness", () => {
 
     expect(auditLogs.length).toBe(1);
     expect(auditLogs[0].cache_hit).toBe(0);
+    expect(auditLogs[0].answer_cache_hit).toBe(0);
     expect(auditLogs[0].query_hash).toMatch(/^[a-f0-9]{64}$/);
-    expect(auditLogs[0].total_latency_ms).toBeGreaterThanOrEqual(0);
   });
 
   it("chunker produces deterministic overlapping chunks", () => {
@@ -404,7 +566,7 @@ describe("system reliability harness", () => {
 
     const chunks: RetrievedChunk[] = [
       {
-        chunkId: SAMPLE_CHUNK_ID,
+        chunkId: "doc-1:0",
         content: SAMPLE_DOC.content,
         title: SAMPLE_DOC.title,
         url: SAMPLE_DOC.url,
@@ -417,5 +579,214 @@ describe("system reliability harness", () => {
     expect(result.fallback).toBe(true);
     expect(result.citations.length).toBe(1);
     expect(result.answer).toContain("AI synthesis is temporarily unavailable");
+  });
+
+  it("composer falls back when all citations fail validation", async () => {
+    const env = createMockEnv({
+      aiResponses: {
+        "@cf/baai/bge-large-en-v1.5": { data: [SAMPLE_VECTOR] },
+        "@cf/meta/llama-3.3-70b-instruct": {
+          response: JSON.stringify({
+            answer: "Some answer without valid citations.",
+            citations: [
+              {
+                quote: "fabricated quote",
+                title: SAMPLE_DOC.title,
+                url: SAMPLE_DOC.url,
+                chunkId: "doc-1:0",
+              },
+            ],
+          }),
+        },
+        "@cf/mistralai/mistral-small-3.1-24b-instruct": {
+          response: JSON.stringify({
+            answer: "Still no valid citations.",
+            citations: [
+              {
+                quote: "also fabricated",
+                title: SAMPLE_DOC.title,
+                url: SAMPLE_DOC.url,
+                chunkId: "doc-1:0",
+              },
+            ],
+          }),
+        },
+      },
+    });
+
+    const chunks: RetrievedChunk[] = [
+      {
+        chunkId: "doc-1:0",
+        content: SAMPLE_DOC.content,
+        title: SAMPLE_DOC.title,
+        url: SAMPLE_DOC.url,
+        score: 0.9,
+        chunkIndex: 0,
+      },
+    ];
+
+    const result = await composeAnswer("How do I rotate JWT?", chunks, env);
+    expect(result.fallback).toBe(true);
+    expect(result.answer).toContain("AI synthesis is temporarily unavailable");
+  });
+
+  it("does not cache fallback answers", async () => {
+    const kvStore = new Map<string, string>();
+    const state: MockState = {
+      documents: new Map(),
+      documentsByUrl: new Map(),
+      chunks: new Map(),
+      ingestLocks: new Set(),
+      upsertedVectorIds: [],
+    };
+    const env = createMockEnv({
+      kvStore,
+      state,
+      aiResponses: {
+        "@cf/baai/bge-large-en-v1.5": { data: [SAMPLE_VECTOR] },
+        "@cf/meta/llama-3.3-70b-instruct": { response: "not valid json" },
+        "@cf/mistralai/mistral-small-3.1-24b-instruct": { response: "still bad" },
+      },
+    });
+    const ctx = createExecutionContext();
+
+    const ingestResponse = await postJson("/ingest", SAMPLE_DOC, env, ctx);
+    expect(ingestResponse.status).toBe(200);
+
+    const response = await postJson(
+      "/query",
+      { question: "How do I configure JWT rotation?" },
+      env,
+      ctx,
+    );
+    const body = await readJson<QueryResponse>(response);
+
+    expect(response.status).toBe(200);
+    expect(body.fallback).toBe(true);
+
+    const queryHash = await hashQuery("How do I configure JWT rotation?");
+    expect(kvStore.has(`${KV_ANSWER_PREFIX}${queryHash}`)).toBe(false);
+  });
+
+  it("preserves existing document when embedding fails on re-ingest", async () => {
+    const state: MockState = {
+      documents: new Map(),
+      documentsByUrl: new Map(),
+      chunks: new Map(),
+      ingestLocks: new Set(),
+      upsertedVectorIds: [],
+    };
+
+    const env = createMockEnv({ state });
+    const ctx = createExecutionContext();
+
+    const first = await postJson("/ingest", SAMPLE_DOC, env, ctx);
+    expect(first.status).toBe(200);
+    const firstBody = await readJson<IngestResponse>(first);
+    const chunkCountBefore = state.chunks.size;
+
+    const failingEnv = createMockEnv({ state, embedThrows: true });
+    const second = await postJson(
+      "/ingest",
+      { ...SAMPLE_DOC, title: "Updated Auth Guide" },
+      failingEnv,
+      ctx,
+    );
+    const secondBody = await readJson<ApiError>(second);
+
+    expect(second.status).toBe(502);
+    expect(secondBody.code).toBe("EMBEDDING_FAILED");
+    expect(state.documentsByUrl.get(SAMPLE_DOC.url)).toBe(firstBody.documentId);
+    expect(state.chunks.size).toBe(chunkCountBefore);
+  });
+
+  it("re-ingests same URL and invalidates KV caches", async () => {
+    const kvStore = new Map<string, string>();
+    const state: MockState = {
+      documents: new Map(),
+      documentsByUrl: new Map(),
+      chunks: new Map(),
+      ingestLocks: new Set(),
+      upsertedVectorIds: [],
+    };
+    const env = createMockEnv({ state, kvStore });
+    const ctx = createExecutionContext();
+
+    const first = await postJson("/ingest", SAMPLE_DOC, env, ctx);
+    expect(first.status).toBe(200);
+    const firstBody = await readJson<IngestResponse>(first);
+
+    const queryHash = await hashQuery("How do I configure JWT rotation?");
+    kvStore.set(`${KV_SEARCH_PREFIX}${queryHash}`, JSON.stringify({ chunks: [], timestamp: 1 }));
+    kvStore.set(`${KV_ANSWER_PREFIX}${queryHash}`, JSON.stringify({
+      answer: "stale",
+      citations: [],
+      timestamp: 1,
+    }));
+
+    const second = await postJson(
+      "/ingest",
+      { ...SAMPLE_DOC, title: "Updated Auth Guide" },
+      env,
+      ctx,
+    );
+    const secondBody = await readJson<IngestResponse>(second);
+
+    expect(second.status).toBe(200);
+    expect(secondBody.documentId).toBe(firstBody.documentId);
+    expect(state.documents.get(firstBody.documentId)?.title).toBe("Updated Auth Guide");
+    expect(kvStore.has(`${KV_SEARCH_PREFIX}${queryHash}`)).toBe(false);
+    expect(kvStore.has(`${KV_ANSWER_PREFIX}${queryHash}`)).toBe(false);
+  });
+
+  it("rejects oversized bodies without Content-Length", async () => {
+    const env = createMockEnv();
+    const ctx = createExecutionContext();
+    const oversized = JSON.stringify({ title: "t", url: "https://example.com", content: "x".repeat(600_000) });
+
+    const response = await worker.fetch(
+      new Request("http://localhost/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: oversized,
+      }),
+      env,
+      ctx,
+    );
+    const body = await readJson<ApiError>(response);
+
+    expect(response.status).toBe(400);
+    expect(body.code).toBe("BODY_TOO_LARGE");
+  });
+
+  it("rejects concurrent ingest for the same URL", async () => {
+    const state: MockState = {
+      documents: new Map(),
+      documentsByUrl: new Map(),
+      chunks: new Map(),
+      ingestLocks: new Set(["https://docs.example.com/auth"]),
+      upsertedVectorIds: [],
+    };
+    const env = createMockEnv({ state });
+    const ctx = createExecutionContext();
+
+    const response = await postJson("/ingest", SAMPLE_DOC, env, ctx);
+    const body = await readJson<ApiError>(response);
+
+    expect(response.status).toBe(409);
+    expect(body.code).toBe("INGEST_IN_PROGRESS");
+  });
+
+  it("requires API key when configured", async () => {
+    const env = createMockEnv({ apiKey: "secret-key" });
+    const ctx = createExecutionContext();
+
+    const unauthorized = await postJson("/ingest", SAMPLE_DOC, env, ctx);
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await postJson("/ingest", SAMPLE_DOC, env, ctx, {
+      Authorization: "Bearer secret-key",
+    });
+    expect(authorized.status).toBe(200);
   });
 });

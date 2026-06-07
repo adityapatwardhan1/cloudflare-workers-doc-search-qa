@@ -1,43 +1,14 @@
 import { composeAnswer } from "../lib/composer";
+import { errorResponse, jsonResponse } from "../lib/http";
 import { hashQuery, searchContext, SearchError } from "../lib/search";
 import { scheduleAuditLog } from "../lib/telemetry";
 import type {
-  ApiError,
   Env,
   KvCacheEntry,
   QueryPayload,
   QueryResponse,
 } from "../types";
 import { KV_ANSWER_PREFIX, KV_CACHE_TTL_SECONDS } from "../types";
-
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...CORS_HEADERS,
-    },
-  });
-}
-
-function errorResponse(
-  code: string,
-  message: string,
-  status: number,
-  details?: string,
-): Response {
-  const body: ApiError = { error: message, code };
-  if (details !== undefined) {
-    body.details = details;
-  }
-  return jsonResponse(body, status);
-}
 
 function buildAnswerCacheKey(queryHash: string): string {
   return `${KV_ANSWER_PREFIX}${queryHash}`;
@@ -84,13 +55,11 @@ async function storeAnswerCache(
   queryHash: string,
   answer: string,
   citations: KvCacheEntry["citations"],
-  fallback: boolean,
 ): Promise<void> {
-  const entry: KvCacheEntry & { fallback?: boolean } = {
+  const entry: KvCacheEntry = {
     answer,
     citations,
     timestamp: Date.now(),
-    fallback,
   };
   await env.KV_CACHE.put(buildAnswerCacheKey(queryHash), JSON.stringify(entry), {
     expirationTtl: KV_CACHE_TTL_SECONDS,
@@ -112,7 +81,8 @@ export async function answerQuery(
   if (cachedAnswer !== null) {
     scheduleAuditLog(env, ctx, {
       queryHash,
-      cacheHit: true,
+      searchCacheHit: false,
+      answerCacheHit: true,
       latencyCacheMs: answerCacheMs,
       latencyVectorMs: 0,
       latencyAiMs: 0,
@@ -123,7 +93,7 @@ export async function answerQuery(
       answer: cachedAnswer.answer,
       citations: cachedAnswer.citations,
       cacheHit: true,
-      fallback: (cachedAnswer as KvCacheEntry & { fallback?: boolean }).fallback ?? false,
+      fallback: false,
     };
     return jsonResponse(response);
   }
@@ -139,17 +109,19 @@ export async function answerQuery(
     );
     const composeMs = performance.now() - composeStart;
 
-    await storeAnswerCache(
-      env,
-      queryHash,
-      composed.answer,
-      composed.citations,
-      composed.fallback,
-    );
+    if (!composed.fallback) {
+      await storeAnswerCache(
+        env,
+        queryHash,
+        composed.answer,
+        composed.citations,
+      );
+    }
 
     scheduleAuditLog(env, ctx, {
       queryHash,
-      cacheHit: false,
+      searchCacheHit: searchResult.cacheHit,
+      answerCacheHit: false,
       latencyCacheMs: answerCacheMs + searchResult.timings.cacheMs,
       latencyVectorMs:
         searchResult.timings.embedMs +
@@ -169,7 +141,8 @@ export async function answerQuery(
   } catch (error) {
     scheduleAuditLog(env, ctx, {
       queryHash,
-      cacheHit: false,
+      searchCacheHit: false,
+      answerCacheHit: false,
       latencyCacheMs: answerCacheMs,
       latencyVectorMs: 0,
       latencyAiMs: 0,

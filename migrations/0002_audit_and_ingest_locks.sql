@@ -1,0 +1,6 @@
+ALTER TABLE audit_logs ADD COLUMN answer_cache_hit INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS ingest_locks (
+  url TEXT PRIMARY KEY,
+  locked_at TEXT NOT NULL
+);

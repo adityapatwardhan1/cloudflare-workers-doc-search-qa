@@ -1,24 +1,14 @@
+import { invalidateQueryCaches } from "../lib/cache";
 import { chunkText } from "../lib/chunker";
-import type {
-  ApiError,
-  Env,
-  IngestPayload,
-  IngestResponse,
-  TextChunk,
-} from "../types";
+import { errorResponse, jsonResponse } from "../lib/http";
+import type { Env, IngestPayload, IngestResponse, TextChunk } from "../types";
 import {
-  D1_BATCH_SIZE,
   EMBEDDING_BATCH_SIZE,
   EMBEDDING_DIMENSIONS,
+  EMBEDDING_MAX_CHARS,
   EMBEDDING_MODEL,
   VECTOR_UPSERT_BATCH_SIZE,
 } from "../types";
-
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
 
 interface EmbeddingResult {
   data?: number[][];
@@ -32,34 +22,16 @@ interface ChunkRecord {
   embedding: number[];
 }
 
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...CORS_HEADERS,
-    },
-  });
-}
-
-function errorResponse(
-  code: string,
-  message: string,
-  status: number,
-  details?: string,
-): Response {
-  const body: ApiError = { error: message, code };
-  if (details !== undefined) {
-    body.details = details;
-  }
-  return jsonResponse(body, status);
+interface ExistingDocument {
+  id: string;
+  vectorIds: string[];
 }
 
 function buildChunkId(documentId: string, chunkIndex: number): string {
   return `${documentId}:${chunkIndex}`;
 }
 
-async function deleteExistingByUrl(env: Env, url: string): Promise<void> {
+async function getExistingDocument(env: Env, url: string): Promise<ExistingDocument | null> {
   const existing = await env.DB_D1.prepare(
     "SELECT id FROM documents WHERE url = ?",
   )
@@ -67,7 +39,7 @@ async function deleteExistingByUrl(env: Env, url: string): Promise<void> {
     .first<{ id: string }>();
 
   if (!existing) {
-    return;
+    return null;
   }
 
   const vectorRows = await env.DB_D1.prepare(
@@ -76,17 +48,25 @@ async function deleteExistingByUrl(env: Env, url: string): Promise<void> {
     .bind(existing.id)
     .all<{ vector_id: string }>();
 
-  const vectorIds = (vectorRows.results ?? []).map((row) => row.vector_id);
-  if (vectorIds.length > 0) {
-    await deleteVectorsInBatches(env, vectorIds);
-  }
+  return {
+    id: existing.id,
+    vectorIds: (vectorRows.results ?? []).map((row) => row.vector_id),
+  };
+}
 
-  await env.DB_D1.prepare("DELETE FROM chunks WHERE document_id = ?")
-    .bind(existing.id)
+async function acquireIngestLock(env: Env, url: string): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await env.DB_D1.prepare(
+    "INSERT INTO ingest_locks (url, locked_at) VALUES (?, ?)",
+  )
+    .bind(url, now)
     .run();
-  await env.DB_D1.prepare("DELETE FROM documents WHERE id = ?")
-    .bind(existing.id)
-    .run();
+
+  return result.success;
+}
+
+async function releaseIngestLock(env: Env, url: string): Promise<void> {
+  await env.DB_D1.prepare("DELETE FROM ingest_locks WHERE url = ?").bind(url).run();
 }
 
 async function deleteVectorsInBatches(env: Env, vectorIds: string[]): Promise<void> {
@@ -115,7 +95,21 @@ function validateEmbeddings(
   return null;
 }
 
+function validateChunkSizes(chunks: TextChunk[]): string | null {
+  for (const chunk of chunks) {
+    if (chunk.content.length > EMBEDDING_MAX_CHARS) {
+      return `Chunk at index ${chunk.index} exceeds embedding model input limit (${chunk.content.length} > ${EMBEDDING_MAX_CHARS} chars)`;
+    }
+  }
+  return null;
+}
+
 async function embedChunks(env: Env, chunks: TextChunk[]): Promise<ChunkRecord[]> {
+  const sizeError = validateChunkSizes(chunks);
+  if (sizeError !== null) {
+    throw new Error(sizeError);
+  }
+
   const records: ChunkRecord[] = [];
 
   for (let i = 0; i < chunks.length; i += EMBEDDING_BATCH_SIZE) {
@@ -146,54 +140,49 @@ async function embedChunks(env: Env, chunks: TextChunk[]): Promise<ChunkRecord[]
   return records;
 }
 
-async function writeDocument(
+async function persistDocumentContent(
   env: Env,
   documentId: string,
   title: string,
   url: string,
-): Promise<void> {
-  const now = new Date().toISOString();
-  const result = await env.DB_D1.prepare(
-    "INSERT INTO documents (id, title, url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-  )
-    .bind(documentId, title, url, now, now)
-    .run();
-
-  if (!result.success) {
-    throw new Error("Failed to insert document row");
-  }
-}
-
-async function writeChunks(
-  env: Env,
-  documentId: string,
   records: ChunkRecord[],
+  isReingest: boolean,
 ): Promise<void> {
   const now = new Date().toISOString();
+  const statements = [];
 
-  for (let i = 0; i < records.length; i += D1_BATCH_SIZE) {
-    const batch = records.slice(i, i + D1_BATCH_SIZE);
-    const statements = batch.map((record) => {
-      const chunkId = buildChunkId(documentId, record.index);
-      record.id = chunkId;
-      record.vectorId = chunkId;
-      return env.DB_D1.prepare(
+  if (isReingest) {
+    statements.push(
+      env.DB_D1.prepare(
+        "UPDATE documents SET title = ?, updated_at = ? WHERE id = ?",
+      ).bind(title, now, documentId),
+    );
+    statements.push(
+      env.DB_D1.prepare("DELETE FROM chunks WHERE document_id = ?").bind(documentId),
+    );
+  } else {
+    statements.push(
+      env.DB_D1.prepare(
+        "INSERT INTO documents (id, title, url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(documentId, title, url, now, now),
+    );
+  }
+
+  for (const record of records) {
+    const chunkId = buildChunkId(documentId, record.index);
+    record.id = chunkId;
+    record.vectorId = chunkId;
+    statements.push(
+      env.DB_D1.prepare(
         "INSERT INTO chunks (id, document_id, chunk_index, content, vector_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).bind(
-        chunkId,
-        documentId,
-        record.index,
-        record.content,
-        chunkId,
-        now,
-      );
-    });
+      ).bind(chunkId, documentId, record.index, record.content, chunkId, now),
+    );
+  }
 
-    const results = await env.DB_D1.batch(statements);
-    for (const result of results) {
-      if (!result.success) {
-        throw new Error("Failed to insert chunk row");
-      }
+  const results = await env.DB_D1.batch(statements);
+  for (const result of results) {
+    if (!result.success) {
+      throw new Error("Failed to persist document content");
     }
   }
 }
@@ -231,19 +220,31 @@ async function rollbackIngest(
   env: Env,
   documentId: string,
   vectorIds: string[],
-): Promise<void> {
+  isReingest: boolean,
+  previousVectorIds: string[],
+): Promise<boolean> {
   try {
     if (vectorIds.length > 0) {
       await deleteVectorsInBatches(env, vectorIds);
     }
-    await env.DB_D1.prepare("DELETE FROM chunks WHERE document_id = ?")
-      .bind(documentId)
-      .run();
-    await env.DB_D1.prepare("DELETE FROM documents WHERE id = ?")
-      .bind(documentId)
-      .run();
+
+    if (!isReingest) {
+      await env.DB_D1.prepare("DELETE FROM chunks WHERE document_id = ?")
+        .bind(documentId)
+        .run();
+      await env.DB_D1.prepare("DELETE FROM documents WHERE id = ?")
+        .bind(documentId)
+        .run();
+    } else if (previousVectorIds.length > 0) {
+      console.error(
+        `Re-ingest rollback: D1 may be inconsistent for document ${documentId}; old vectors preserved`,
+      );
+    }
+
+    return true;
   } catch (rollbackError) {
     console.error("Ingest rollback failed:", rollbackError);
+    return false;
   }
 }
 
@@ -260,45 +261,29 @@ export async function ingestDocument(
     );
   }
 
-  const documentId = crypto.randomUUID();
+  const existing = await getExistingDocument(env, payload.url);
+  const documentId = existing?.id ?? crypto.randomUUID();
+  const previousVectorIds = existing?.vectorIds ?? [];
+  const isReingest = existing !== null;
+
+  const lockAcquired = await acquireIngestLock(env, payload.url);
+  if (!lockAcquired) {
+    return errorResponse(
+      "INGEST_IN_PROGRESS",
+      "Another ingest for this URL is already in progress",
+      409,
+    );
+  }
+
   const upsertedVectorIds: string[] = [];
 
   try {
-    await deleteExistingByUrl(env, payload.url);
-
     const records = await embedChunks(env, chunks);
 
     for (const record of records) {
       const vectorId = buildChunkId(documentId, record.index);
       record.id = vectorId;
       record.vectorId = vectorId;
-    }
-
-    try {
-      await writeDocument(env, documentId, payload.title, payload.url);
-    } catch (writeError) {
-      const message =
-        writeError instanceof Error ? writeError.message : "Unknown write error";
-      return errorResponse(
-        "D1_WRITE_FAILED",
-        "Failed to persist document metadata",
-        500,
-        message,
-      );
-    }
-
-    try {
-      await writeChunks(env, documentId, records);
-    } catch (writeError) {
-      await rollbackIngest(env, documentId, upsertedVectorIds);
-      const message =
-        writeError instanceof Error ? writeError.message : "Unknown write error";
-      return errorResponse(
-        "D1_WRITE_FAILED",
-        "Failed to persist document chunks",
-        500,
-        message,
-      );
     }
 
     try {
@@ -311,15 +296,61 @@ export async function ingestDocument(
       );
       upsertedVectorIds.push(...vectorIds);
     } catch (writeError) {
-      await rollbackIngest(env, documentId, upsertedVectorIds);
-      const message =
-        writeError instanceof Error ? writeError.message : "Unknown write error";
+      console.error("Vectorize upsert failed:", writeError);
       return errorResponse(
         "VECTORIZE_UPSERT_FAILED",
         "Failed to upsert vectors into Vectorize",
         502,
-        message,
       );
+    }
+
+    try {
+      await persistDocumentContent(
+        env,
+        documentId,
+        payload.title,
+        payload.url,
+        records,
+        isReingest,
+      );
+    } catch (writeError) {
+      const rolledBack = await rollbackIngest(
+        env,
+        documentId,
+        upsertedVectorIds,
+        isReingest,
+        previousVectorIds,
+      );
+      console.error("D1 write failed:", writeError);
+      if (!rolledBack) {
+        return errorResponse(
+          "ROLLBACK_FAILED",
+          "Failed to persist document and cleanup could not be completed",
+          500,
+        );
+      }
+      return errorResponse(
+        "D1_WRITE_FAILED",
+        "Failed to persist document content",
+        500,
+      );
+    }
+
+    const orphanedVectorIds = previousVectorIds.filter(
+      (id) => !upsertedVectorIds.includes(id),
+    );
+    if (orphanedVectorIds.length > 0) {
+      try {
+        await deleteVectorsInBatches(env, orphanedVectorIds);
+      } catch (cleanupError) {
+        console.error("Failed to delete orphaned vectors after re-ingest:", cleanupError);
+      }
+    }
+
+    try {
+      await invalidateQueryCaches(env);
+    } catch (cacheError) {
+      console.error("Failed to invalidate query caches after ingest:", cacheError);
     }
 
     const response: IngestResponse = {
@@ -330,6 +361,9 @@ export async function ingestDocument(
     return jsonResponse(response);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown ingest error";
-    return errorResponse("EMBEDDING_FAILED", "Failed to generate embeddings", 502, message);
+    console.error("Ingest embedding failed:", message);
+    return errorResponse("EMBEDDING_FAILED", "Failed to generate embeddings", 502);
+  } finally {
+    await releaseIngestLock(env, payload.url);
   }
 }

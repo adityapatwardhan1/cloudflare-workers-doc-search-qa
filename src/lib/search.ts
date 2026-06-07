@@ -120,10 +120,10 @@ async function queryVectorIndex(
       returnMetadata: "none",
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown Vectorize error";
+    console.error("Vectorize query failed:", error);
     throw new SearchError(
       "VECTORIZE_QUERY_FAILED",
-      `Failed to query Vectorize index: ${message}`,
+      "Failed to query Vectorize index",
       502,
     );
   }
@@ -165,10 +165,10 @@ async function fetchChunksFromD1(
     chunks.sort((a, b) => b.score - a.score);
     return chunks;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown D1 error";
+    console.error("D1 chunk fetch failed:", error);
     throw new SearchError(
       "D1_FETCH_FAILED",
-      `Failed to fetch chunk context from D1: ${message}`,
+      "Failed to fetch chunk context from D1",
       500,
     );
   }

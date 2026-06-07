@@ -1,3 +1,8 @@
+import { ingestDocument } from "./handlers/ingest";
+import { answerQuery } from "./handlers/query";
+import { requireAuth } from "./lib/auth";
+import { errorResponse, jsonResponse, CORS_HEADERS } from "./lib/http";
+import { searchContext, SearchError } from "./lib/search";
 import type {
   ApiError,
   Env,
@@ -6,46 +11,9 @@ import type {
   QueryPayload,
   SanitizeResult,
 } from "./types";
-import { ingestDocument } from "./handlers/ingest";
-import { answerQuery } from "./handlers/query";
-import { searchContext, SearchError } from "./lib/search";
 import { VALIDATION_LIMITS } from "./types";
 
 const WORKER_VERSION = "1.0.0";
-
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function jsonResponse(
-  data: unknown,
-  status = 200,
-  extraHeaders: Record<string, string> = {},
-): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...CORS_HEADERS,
-      ...extraHeaders,
-    },
-  });
-}
-
-function errorResponse(
-  code: string,
-  message: string,
-  status: number,
-  details?: string,
-): Response {
-  const body: ApiError = { error: message, code };
-  if (details !== undefined) {
-    body.details = details;
-  }
-  return jsonResponse(body, status);
-}
 
 export function isApiError(value: unknown): value is ApiError {
   if (typeof value !== "object" || value === null) {
@@ -158,6 +126,17 @@ export function validateQueryPayload(raw: unknown): SanitizeResult<QueryPayload>
   return { question };
 }
 
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
 async function readJsonBody(request: Request): Promise<unknown | ApiError> {
   const contentLength = request.headers.get("Content-Length");
   if (contentLength !== null) {
@@ -173,8 +152,37 @@ async function readJsonBody(request: Request): Promise<unknown | ApiError> {
     }
   }
 
+  if (!request.body) {
+    return {};
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    totalBytes += value.byteLength;
+    if (totalBytes > VALIDATION_LIMITS.MAX_BODY_BYTES) {
+      return {
+        error: `Request body exceeds maximum size of ${VALIDATION_LIMITS.MAX_BODY_BYTES} bytes`,
+        code: "BODY_TOO_LARGE",
+      };
+    }
+    chunks.push(value);
+  }
+
+  if (totalBytes === 0) {
+    return {};
+  }
+
+  const bodyText = new TextDecoder().decode(concatUint8Arrays(chunks));
+
   try {
-    return await request.json();
+    return JSON.parse(bodyText);
   } catch {
     return { error: "Request body must be valid JSON", code: "MALFORMED_JSON" };
   }
@@ -190,28 +198,38 @@ function handleHealth(): Response {
 }
 
 async function handleIngest(request: Request, env: Env): Promise<Response> {
+  const authError = requireAuth(request, env);
+  if (authError !== null) {
+    return authError;
+  }
+
   const raw = await readJsonBody(request);
   if (isApiError(raw)) {
-    return errorResponse(raw.code, raw.error, 400, raw.details);
+    return errorResponse(raw.code, raw.error, 400);
   }
 
   const payload = validateIngestPayload(raw);
   if (isApiError(payload)) {
-    return errorResponse(payload.code, payload.error, 400, payload.details);
+    return errorResponse(payload.code, payload.error, 400);
   }
 
   return ingestDocument(payload, env);
 }
 
 async function handleSearch(request: Request, env: Env): Promise<Response> {
+  const authError = requireAuth(request, env);
+  if (authError !== null) {
+    return authError;
+  }
+
   const raw = await readJsonBody(request);
   if (isApiError(raw)) {
-    return errorResponse(raw.code, raw.error, 400, raw.details);
+    return errorResponse(raw.code, raw.error, 400);
   }
 
   const payload = validateQueryPayload(raw);
   if (isApiError(payload)) {
-    return errorResponse(payload.code, payload.error, 400, payload.details);
+    return errorResponse(payload.code, payload.error, 400);
   }
 
   try {
@@ -230,14 +248,19 @@ async function handleQuery(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  const authError = requireAuth(request, env);
+  if (authError !== null) {
+    return authError;
+  }
+
   const raw = await readJsonBody(request);
   if (isApiError(raw)) {
-    return errorResponse(raw.code, raw.error, 400, raw.details);
+    return errorResponse(raw.code, raw.error, 400);
   }
 
   const payload = validateQueryPayload(raw);
   if (isApiError(payload)) {
-    return errorResponse(payload.code, payload.error, 400, payload.details);
+    return errorResponse(payload.code, payload.error, 400);
   }
 
   return answerQuery(payload, env, ctx);
