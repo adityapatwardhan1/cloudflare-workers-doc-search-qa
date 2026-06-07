@@ -1,0 +1,22 @@
+name = "doc-search-qa"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[ai]
+binding = "AI"
+remote = true
+
+[[kv_namespaces]]
+binding = "KV_CACHE"
+id = "2d3c4c236ff542cda4a5ad819b267f9e"
+
+[[d1_databases]]
+binding = "DB_D1"
+database_name = "doc-search-db"
+database_id = "13f1da3d-833e-44eb-907f-b6700f3c310f"
+migrations_dir = "migrations"
+
+[[vectorize]]
+binding = "VECTOR_INDEX"
+index_name = "doc-search-vectors"
+remote = true
