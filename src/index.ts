@@ -7,6 +7,7 @@ import type {
   SanitizeResult,
 } from "./types";
 import { ingestDocument } from "./handlers/ingest";
+import { answerQuery } from "./handlers/query";
 import { searchContext, SearchError } from "./lib/search";
 import { VALIDATION_LIMITS } from "./types";
 
@@ -224,7 +225,11 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function handleQuery(request: Request): Promise<Response> {
+async function handleQuery(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const raw = await readJsonBody(request);
   if (isApiError(raw)) {
     return errorResponse(raw.code, raw.error, 400, raw.details);
@@ -235,15 +240,11 @@ async function handleQuery(request: Request): Promise<Response> {
     return errorResponse(payload.code, payload.error, 400, payload.details);
   }
 
-  return errorResponse(
-    "NOT_IMPLEMENTED",
-    "Query handler will be wired in Step 4",
-    501,
-  );
+  return answerQuery(payload, env, ctx);
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return handleOptions();
     }
@@ -264,7 +265,7 @@ export default {
     }
 
     if (request.method === "POST" && path === "/query") {
-      return handleQuery(request);
+      return handleQuery(request, env, ctx);
     }
 
     return errorResponse("NOT_FOUND", `No route matches ${request.method} ${path}`, 404);

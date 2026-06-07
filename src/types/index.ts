@@ -13,6 +13,7 @@ export const GENERATION_MODEL_FALLBACK =
 export const EMBEDDING_DIMENSIONS = 1024;
 export const KV_CACHE_TTL_SECONDS = 3600;
 export const KV_SEARCH_PREFIX = "search:" as const;
+export const KV_ANSWER_PREFIX = "answer:" as const;
 export const VECTOR_TOP_K = 5;
 
 export const CHUNK_SIZE = 1000;
@@ -148,6 +149,12 @@ export interface QueryResponse {
   answer: string;
   citations: Citation[];
   cacheHit: boolean;
+  fallback: boolean;
+}
+
+export interface ComposerResult {
+  answer: string;
+  citations: Citation[];
   fallback: boolean;
 }
 
