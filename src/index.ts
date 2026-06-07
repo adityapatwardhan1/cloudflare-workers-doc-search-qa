@@ -7,6 +7,7 @@ import type {
   SanitizeResult,
 } from "./types";
 import { ingestDocument } from "./handlers/ingest";
+import { searchContext, SearchError } from "./lib/search";
 import { VALIDATION_LIMITS } from "./types";
 
 const WORKER_VERSION = "1.0.0";
@@ -201,6 +202,28 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   return ingestDocument(payload, env);
 }
 
+async function handleSearch(request: Request, env: Env): Promise<Response> {
+  const raw = await readJsonBody(request);
+  if (isApiError(raw)) {
+    return errorResponse(raw.code, raw.error, 400, raw.details);
+  }
+
+  const payload = validateQueryPayload(raw);
+  if (isApiError(payload)) {
+    return errorResponse(payload.code, payload.error, 400, payload.details);
+  }
+
+  try {
+    const result = await searchContext(payload.question, env);
+    return jsonResponse(result);
+  } catch (error) {
+    if (error instanceof SearchError) {
+      return errorResponse(error.code, error.message, error.status);
+    }
+    return errorResponse("SEARCH_FAILED", "Unexpected search error", 500);
+  }
+}
+
 async function handleQuery(request: Request): Promise<Response> {
   const raw = await readJsonBody(request);
   if (isApiError(raw)) {
@@ -234,6 +257,10 @@ export default {
 
     if (request.method === "POST" && path === "/ingest") {
       return handleIngest(request, env);
+    }
+
+    if (request.method === "POST" && path === "/search") {
+      return handleSearch(request, env);
     }
 
     if (request.method === "POST" && path === "/query") {

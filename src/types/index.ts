@@ -12,6 +12,7 @@ export const GENERATION_MODEL_FALLBACK =
   "@cf/mistralai/mistral-small-3.1-24b-instruct" as const;
 export const EMBEDDING_DIMENSIONS = 1024;
 export const KV_CACHE_TTL_SECONDS = 3600;
+export const KV_SEARCH_PREFIX = "search:" as const;
 export const VECTOR_TOP_K = 5;
 
 export const CHUNK_SIZE = 1000;
@@ -67,6 +68,35 @@ export interface KvCacheEntry {
   answer: string;
   citations: Citation[];
   timestamp: number;
+}
+
+export interface RetrievedChunk {
+  chunkId: string;
+  content: string;
+  title: string;
+  url: string;
+  score: number;
+  chunkIndex: number;
+}
+
+export interface KvSearchCacheEntry {
+  chunks: RetrievedChunk[];
+  timestamp: number;
+}
+
+export interface SearchTimings {
+  cacheMs: number;
+  embedMs: number;
+  vectorMs: number;
+  d1Ms: number;
+  totalMs: number;
+}
+
+export interface SearchContextResult {
+  chunks: RetrievedChunk[];
+  cacheHit: boolean;
+  queryHash: string;
+  timings: SearchTimings;
 }
 
 export interface DocumentRow {
